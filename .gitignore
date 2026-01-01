@@ -1,2 +1,6 @@
 # mise
 mise.local.toml
+
+# application logic
+tmp/*.csv
+tmp/*.xlsx

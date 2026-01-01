@@ -77,3 +77,7 @@ type FileLockInfo struct {
 type PropertyGroup struct {
 	// TODO
 }
+
+type Cursor struct {
+	Cursor string
+}
