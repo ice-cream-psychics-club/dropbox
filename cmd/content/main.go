@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/ice-cream-psychics-club/dropbox/internal/pkg/api"
+	"github.com/ice-cream-psychics-club/dropbox/internal/pkg/content"
 	"github.com/ice-cream-psychics-club/dropbox/internal/pkg/subscriber"
 	"github.com/ice-cream-psychics-club/dropbox/pkg/csv"
 	"github.com/ice-cream-psychics-club/dropbox/pkg/dropbox"
@@ -37,31 +38,94 @@ func main() {
 		Level: slog.LevelDebug,
 	}))
 
+	// build APIs
 	oauth2, err := api.NewOAuth2(clientID, redirectURL, logger)
 	if err != nil {
 		panic(err)
 	}
 
 	dbx := api.NewDropbox(clientSecret, logger)
+
+	// build subscribers
 	debugger := &subscriber.Logger{
 		Logger: logger,
 	}
-	propagator := &subscriber.Propagator{
+	convertSubmissionsToCSV := &subscriber.Propagator{
 		Source: "responses.xlsx",
 		Targets: []subscriber.Target{
 			{
-				Name: "responses.csv",
+				Name: "submissions.csv",
 				Transform: func(r io.Reader) (io.Reader, error) {
 					// TODO: add transformations
-
-					// TODO: consider diffing methods -> append mode, while still handling edits
-					// (perhaps just treat a column or set of columns as a PK ?)
 					filePath := "./tmp/responses.xlsx"
 					return xlsxToCSV(filePath, r)
 				},
 			},
 		},
 		Logger: logger,
+	}
+	parseSubmissions := &subscriber.Propagator{
+		Source: "ratings.csv",
+		Targets: []subscriber.Target{
+			{
+				Name: "submissions.csv",
+				Transform: func(r io.Reader) (io.Reader, error) {
+					// import current ratings
+					ratingsReader, err := dbx.Client.Download("ratings.csv")
+					if err != nil {
+						return nil, fmt.Errorf("error downloading ratings: %w", err)
+					}
+					ratings, members, err := content.ImportRatings(ratingsReader)
+					if err != nil {
+						return nil, fmt.Errorf("error importing ratings: %w", err)
+					}
+
+					// import previous submissions
+					prevReader, err := dbx.Client.Download("prev_responses.csv")
+					if err != nil {
+						return nil, fmt.Errorf("error downloading previous responses: %w", err)
+					}
+					prev, err := content.ImportSubmissions(prevReader)
+					if err != nil {
+						return nil, fmt.Errorf("error importing previous submissions: %w", err)
+					}
+
+					// import current submissions
+					curr, err := content.ImportSubmissions(r)
+					if err != nil {
+						return nil, fmt.Errorf("error importing submissions: %w", err)
+					}
+
+					// cal
+					delta := content.CalculateDelta(prev, curr)
+					if len(delta) == 0 {
+						return r, nil
+					}
+
+					for _, s := range delta {
+						id := content.SubmissionID{
+							Title:     s.Title,
+							Submitter: s.Member,
+						}
+
+						for _, m := range members {
+							ratings[id] = append(ratings[id], content.Rating{
+								Rater:        m,
+								Interest:     -1,
+								SubmissionID: id,
+							})
+						}
+					}
+
+					buff := &bytes.Buffer{}
+					if err := content.ExportRatings(ratings, members, buff); err != nil {
+						return nil, fmt.Errorf("error exporting ratings: %w", err)
+					}
+
+					return buff, nil
+				},
+			},
+		},
 	}
 
 	// start server
@@ -81,8 +145,8 @@ func main() {
 		Logger:     logger,
 	}
 
-	propagator.Client = client
-	dbx.Subscribe(debugger, propagator)
+	convertSubmissionsToCSV.Client = client
+	dbx.Subscribe(debugger, convertSubmissionsToCSV, parseSubmissions)
 	dbx.SetClient(client)
 
 	logger.Debug("ready to make dropbox requests")
@@ -97,15 +161,17 @@ func main() {
 }
 
 func newRouter(dbx *api.Dropbox, oauth2 *api.OAuth2) *mux.Router {
-	router := mux.NewRouter()
-	router.HandleFunc("/", oauth2.AuthorizeHandle)
-	router.HandleFunc("/file/metadata", dbx.DescribeFile).Methods("GET")
-	router.HandleFunc("/folder", dbx.DescribeFolder).Methods("GET")
-	router.HandleFunc("/update", dbx.VerifyWebhook).Methods("GET")
-	router.HandleFunc("/update", dbx.ReceiveUpdate).Methods("POST")
-	router.HandleFunc("/oauth2/callback", oauth2.ExchangeHandle)
+	base := mux.NewRouter()
+	base.HandleFunc("/", oauth2.AuthorizeHandle)
+	base.HandleFunc("/oauth2/callback", oauth2.ExchangeHandle)
 
-	return router
+	dropbox := base.Path("dropbox").Subrouter()
+	dropbox.HandleFunc("/file", dbx.DescribeFile).Methods("GET")
+	dropbox.HandleFunc("/folder", dbx.DescribeFolder).Methods("GET")
+	dropbox.HandleFunc("/update", dbx.VerifyWebhook).Methods("GET")
+	dropbox.HandleFunc("/update", dbx.ReceiveUpdate).Methods("POST")
+
+	return base
 }
 
 func getEnvOrElse(k string) string {

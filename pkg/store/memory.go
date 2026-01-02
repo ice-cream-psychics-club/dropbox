@@ -5,36 +5,46 @@ import (
 	"sync"
 )
 
-var ErrNotFound = errors.New("no cursor for account - yet")
+var ErrNotFound = errors.New("no value for key")
 
 type MemoryStore struct {
-	Cursors map[string]string
+	values map[string]string
 	sync.RWMutex
 }
 
-func (s *MemoryStore) Set(account, cursor string) {
+func (s *MemoryStore) Set(key, value string) {
 	s.Lock()
 	defer s.Unlock()
 
-	if s.Cursors == nil {
-		s.Cursors = make(map[string]string)
+	if s.values == nil {
+		s.values = make(map[string]string)
 	}
-	
-	s.Cursors[account] = cursor
+
+	s.values[key] = value
 }
 
-func (s *MemoryStore) Get(account string) (string, error) {
+func (s *MemoryStore) Get(key string) (string, error) {
 	s.RLock()
 	defer s.RUnlock()
 
-	if s.Cursors == nil {
-		s.Cursors = make(map[string]string)
+	if s.values == nil {
+		s.values = make(map[string]string)
 	}
 
-	cursor, ok := s.Cursors[account]
+	value, ok := s.values[key]
 	if !ok {
 		return "", ErrNotFound
 	}
 
-	return cursor, nil
+	return value, nil
+}
+
+func (s *MemoryStore) Delete(key string) bool {
+	s.Lock()
+	defer s.Unlock()
+
+	_, ok := s.values[key]
+	delete(s.values, key)
+
+	return ok
 }
