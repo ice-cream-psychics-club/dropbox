@@ -8,9 +8,6 @@ import (
 	"github.com/ice-cream-psychics-club/dropbox/pkg/dropbox"
 )
 
-// TODO: consider diffing methods -> append mode, while still handling edits
-// (perhaps just treat a column or set of columns as a PK ?)
-
 type Propagator struct {
 	Source  string
 	Targets []Target

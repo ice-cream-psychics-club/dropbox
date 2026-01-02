@@ -7,7 +7,7 @@ import (
 	"github.com/tealeg/xlsx/v3"
 )
 
-// TODO: cleanup; no support io interfaces ? :c
+// TODO: cleanup; no support for IO interfaces ? :c
 func FromXLSX(fileName string, w io.Writer) error {
 	xlsxFile, err := xlsx.OpenFile(fileName)
 	if err != nil {
@@ -20,7 +20,8 @@ func FromXLSX(fileName string, w io.Writer) error {
 	var vals []string
 	err = sheet.ForEachRow(func(row *xlsx.Row) error {
 		if row == nil {
-			return nil // TODO: ?
+			// TODO: does this just mean the row cells are null ?
+			return nil
 		}
 
 		vals = vals[:0]

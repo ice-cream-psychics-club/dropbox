@@ -5,8 +5,8 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"golang.org/x/oauth2"
@@ -21,15 +21,16 @@ const (
 )
 
 type OAuth2 struct {
-	config       *oauth2.Config
-	authURL      string
-	codeVerifier string
-	state        string
-	token        *oauth2.Token
-	client       chan *http.Client
+	config            *oauth2.Config
+	authURL           string
+	codeVerifier      string
+	state             string
+	token             *oauth2.Token
+	client            chan *http.Client
+	errResponseWriter ErrHandler
 }
 
-func NewOAuth2(clientID, redirectURL string) (*OAuth2, error) {
+func NewOAuth2(clientID, redirectURL string, logger *slog.Logger) (*OAuth2, error) {
 	b := make([]byte, 96)
 	if _, err := rand.Read(b); err != nil {
 		return nil, fmt.Errorf("error generating code verifier: %w", err)
@@ -65,6 +66,9 @@ func NewOAuth2(clientID, redirectURL string) (*OAuth2, error) {
 		codeVerifier: codeVerifier,
 		state:        state,
 		client:       make(chan *http.Client),
+		errResponseWriter: ErrHandler{
+			Logger: logger,
+		},
 	}, nil
 }
 
@@ -77,7 +81,7 @@ func (o *OAuth2) ExchangeHandle(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get(state)
 
 	if subtle.ConstantTimeCompare([]byte(o.state), []byte(state)) == 0 {
-		WriteErrResponse(w, http.StatusBadRequest, &Error{
+		o.errResponseWriter.Write(w, http.StatusBadRequest, &Error{
 			Type:    "OAuth2Error",
 			Message: "states not equal",
 		})
@@ -88,7 +92,7 @@ func (o *OAuth2) ExchangeHandle(w http.ResponseWriter, r *http.Request) {
 		"code_verifier", o.codeVerifier,
 	))
 	if err != nil {
-		WriteErrResponse(w, http.StatusBadRequest, &Error{
+		o.errResponseWriter.Write(w, http.StatusBadRequest, &Error{
 			Type:    "OAuth2Error",
 			Message: fmt.Sprintf("error exchanging token: %v", err),
 		})
@@ -103,34 +107,4 @@ func (o *OAuth2) ExchangeHandle(w http.ResponseWriter, r *http.Request) {
 
 func (o *OAuth2) Client() <-chan *http.Client {
 	return o.client
-}
-
-type Error struct {
-	Type    string
-	Message string
-}
-
-func (e *Error) Error() string {
-	return e.Type + ": " + e.Message
-}
-
-func WriteErrResponse(w http.ResponseWriter, statusCode int, err error) {
-	apiErr, ok := err.(*Error)
-	if !ok {
-		w.Header().Add("Content-Type", "text/plain")
-		w.WriteHeader(statusCode)
-		w.Write([]byte(err.Error()))
-		return
-	}
-
-	body, err := json.Marshal(apiErr)
-	if err != nil {
-		w.Header().Add("Content-Type", "text/plain")
-		w.WriteHeader(statusCode)
-		w.Write([]byte(err.Error()))
-	}
-
-	w.Header().Add("Content-Type", "text/json")
-	w.WriteHeader(statusCode)
-	w.Write(body)
 }

@@ -16,47 +16,55 @@ import (
 	"github.com/ice-cream-psychics-club/dropbox/pkg/store"
 )
 
-// TODO: DRY
+var ErrStartup = errors.New("server is still starting up")
+
+func NewDropbox(clientSecret string, logger *slog.Logger) *Dropbox {
+	return &Dropbox{
+		Logger:       logger,
+		ClientSecret: clientSecret,
+		errHandler: ErrHandler{
+			Logger: logger,
+		},
+		cursors: &store.MemoryStore{},
+	}
+}
 
 type Dropbox struct {
 	Client       *dropbox.Client
-	Cursors      *store.MemoryStore
 	Logger       *slog.Logger
 	ClientSecret string
-	ready        atomic.Bool
 
+	ready       atomic.Bool
+	errHandler  ErrHandler
+	cursors     *store.MemoryStore
 	subscribers []Subscriber
-}
-
-func (dbx *Dropbox) SetClient(client *dropbox.Client) {
-	dbx.Client = client
-	dbx.ready.Store(true)
 }
 
 type Subscriber interface {
 	Handle(account string, files []dropbox.File) error
 }
 
-func (dbx *Dropbox) Subscribe(subscribers ...Subscriber) {
-	dbx.subscribers = append(dbx.subscribers, subscribers...)
+func (d *Dropbox) SetClient(client *dropbox.Client) {
+	d.Client = client
+	d.ready.Store(true)
 }
 
-type Folder struct {
-	Files []dropbox.File `json:"files"`
+func (d *Dropbox) Subscribe(subscribers ...Subscriber) {
+	d.subscribers = append(d.subscribers, subscribers...)
 }
 
-func (dbx *Dropbox) DescribeFolder(w http.ResponseWriter, r *http.Request) {
-	if !dbx.ready.Load() {
-		WriteErrResponse(w, http.StatusServiceUnavailable, fmt.Errorf("server is still starting up"))
+func (d *Dropbox) DescribeFolder(w http.ResponseWriter, r *http.Request) {
+	if !d.ready.Load() {
+		d.errHandler.Write(w, http.StatusServiceUnavailable, ErrStartup)
 		return
 	}
 
 	folderName := r.URL.Query().Get("name")
 	cursor := r.URL.Query().Get("cursor")
 
-	folder, err := dbx.Client.ListFolder(folderName, cursor)
+	folder, err := d.Client.ListFolder(folderName, cursor)
 	if err != nil {
-		WriteErrResponse(w, http.StatusInternalServerError, &Error{
+		d.errHandler.Write(w, http.StatusInternalServerError, &Error{
 			Type:    "BackendError",
 			Message: err.Error(),
 		})
@@ -65,7 +73,7 @@ func (dbx *Dropbox) DescribeFolder(w http.ResponseWriter, r *http.Request) {
 
 	body, err := json.Marshal(&folder)
 	if err != nil {
-		WriteErrResponse(w, http.StatusInternalServerError, &Error{
+		d.errHandler.Write(w, http.StatusInternalServerError, &Error{
 			Type:    "JSONError",
 			Message: err.Error(),
 		})
@@ -76,33 +84,33 @@ func (dbx *Dropbox) DescribeFolder(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
-func (dbx *Dropbox) DescribeFile(w http.ResponseWriter, r *http.Request) {
-	if !dbx.ready.Load() {
-		WriteErrResponse(w, http.StatusServiceUnavailable, fmt.Errorf("server is still starting up"))
+func (d *Dropbox) DescribeFile(w http.ResponseWriter, r *http.Request) {
+	if !d.ready.Load() {
+		d.errHandler.Write(w, http.StatusServiceUnavailable, ErrStartup)
 		return
 	}
 
 	path := r.URL.Query().Get("path")
 	if len(path) == 0 {
-		WriteErrResponse(w, http.StatusBadRequest, &Error{
-			Type:    "MissingInfo",
+		d.errHandler.Write(w, http.StatusBadRequest, &Error{
+			Type:    "MissingField",
 			Message: "missing `path` parameter in request URL",
 		})
 		return
 	}
 
-	metadata, err := dbx.Client.DescribeFile(path)
+	file, err := d.Client.DescribeFile(path)
 	if err != nil {
-		WriteErrResponse(w, http.StatusInternalServerError, &Error{
+		d.errHandler.Write(w, http.StatusInternalServerError, &Error{
 			Type:    "BackendError",
 			Message: err.Error(),
 		})
 		return
 	}
 
-	body, err := json.Marshal(&metadata)
+	body, err := json.Marshal(&file)
 	if err != nil {
-		WriteErrResponse(w, http.StatusInternalServerError, &Error{
+		d.errHandler.Write(w, http.StatusInternalServerError, &Error{
 			Type:    "JSONError",
 			Message: err.Error(),
 		})
@@ -113,7 +121,12 @@ func (dbx *Dropbox) DescribeFile(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
-func (dbx *Dropbox) VerifyWebhook(w http.ResponseWriter, r *http.Request) {
+func (d *Dropbox) VerifyWebhook(w http.ResponseWriter, r *http.Request) {
+	if !d.ready.Load() {
+		d.errHandler.Write(w, http.StatusServiceUnavailable, ErrStartup)
+		return
+	}
+
 	challenge := r.URL.Query().Get("challenge")
 	w.Header().Set("Content-Type", "text/plain")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -122,73 +135,76 @@ func (dbx *Dropbox) VerifyWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-type Update struct {
-	ListFolder struct {
-		Accounts []Account `json:"accounts"`
-	} `json:"list_folder"`
-}
-
-type Account string
-
-func (dbx *Dropbox) ReceiveUpdate(w http.ResponseWriter, r *http.Request) {
-	if !dbx.ready.Load() {
-		WriteErrResponse(w, http.StatusServiceUnavailable, fmt.Errorf("server is still starting up"))
+func (d *Dropbox) ReceiveUpdate(w http.ResponseWriter, r *http.Request) {
+	if !d.ready.Load() {
+		d.errHandler.Write(w, http.StatusServiceUnavailable, ErrStartup)
 		return
 	}
 
+	// verify signature
 	received := r.Header.Get("X-Dropbox-Signature")
 	if len(received) == 0 {
-		w.WriteHeader(http.StatusUnauthorized)
-		dbx.Logger.Error("missing header `X-Dropbox-Signature`")
+		d.errHandler.Write(w, http.StatusBadRequest, &Error{
+			Type:    "MissingField",
+			Message: "missing header `X-Dropbox-Signature`",
+		})
 		return
 	}
 
-	mac := hmac.New(sha256.New, []byte(dbx.ClientSecret))
+	mac := hmac.New(sha256.New, []byte(d.ClientSecret))
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		dbx.Logger.Error(fmt.Sprintf("error reading request body: %v", err))
+		d.errHandler.Write(w, http.StatusBadRequest,
+			fmt.Errorf("error reading request body: %v", err),
+		)
 		return
 	}
 
 	if _, err := mac.Write(body); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		dbx.Logger.Error(fmt.Sprintf("error calculating expected MAC: %v", err))
+		d.errHandler.Write(w, http.StatusInternalServerError,
+			fmt.Errorf("error calculating expected MAC: %w", err),
+		)
 		return
 	}
 	expected := hex.EncodeToString(mac.Sum(nil))
 
 	if !hmac.Equal([]byte(received), []byte(expected)) {
-		w.WriteHeader(http.StatusForbidden)
-		dbx.Logger.Error(fmt.Sprintf("MACs did not match: expected %s, received %s", expected, received))
+		d.errHandler.Write(w, http.StatusForbidden,
+			fmt.Errorf("MACs did not match: expected %s, received %s", expected, received),
+		)
 		return
 	}
 
-	var update Update
+	// decode the update
+	var update dropbox.Update
 	if err := json.Unmarshal(body, &update); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		dbx.Logger.Error(fmt.Sprintf("error parsing request body %s: %w", string(body), err))
+		d.errHandler.Write(w, http.StatusBadRequest, &Error{
+			Type:    "JSONError",
+			Message: err.Error(),
+		})
 		return
 	}
 
+	// return response before processing the update
 	w.WriteHeader(http.StatusAccepted)
 
-	if err := dbx.processUpdate(update.ListFolder.Accounts); err != nil {
-		dbx.Logger.Error(fmt.Sprintf("error processing update: %v", err))
+	if err := d.processUpdate(update.ListFolder.Accounts); err != nil {
+		d.Logger.Error(fmt.Sprintf("error processing update: %v", err))
 	}
 }
 
-func (dbx *Dropbox) processUpdate(accounts []Account) error {
+func (d *Dropbox) processUpdate(accounts []dropbox.Account) error {
 	latest := ""
 	for _, a := range accounts {
 		account := string(a)
 
-		cursor, err := dbx.Cursors.Get(account)
+		cursor, err := d.cursors.Get(account)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return err
 		}
 		if errors.Is(err, store.ErrNotFound) && latest == "" {
-			cursor, err := dbx.Client.GetLatestCursor("")
+			// no cursor in store yet; go get the latest
+			cursor, err := d.Client.GetLatestCursor("")
 			if err != nil {
 				return fmt.Errorf("error getting latest cursor: %w", err)
 			}
@@ -196,16 +212,20 @@ func (dbx *Dropbox) processUpdate(accounts []Account) error {
 			latest = cursor
 		}
 		if errors.Is(err, store.ErrNotFound) {
+			// store latest cursor so we can reference it on future calls
 			cursor = latest
-			dbx.Cursors.Set(account, latest)
+			d.cursors.Set(account, latest)
+			continue
 		}
 
-		folder, err := dbx.Client.ListFolder("", cursor)
+		// get the delta from the previous cursor
+		folder, err := d.Client.ListFolder("", cursor)
 		if err != nil {
 			return fmt.Errorf("error listing folder for %s @ cursor %s: %w", account, cursor, err)
 		}
 
-		for _, subscriber := range dbx.subscribers {
+		// fan out the update to subscribers
+		for _, subscriber := range d.subscribers {
 			if err := subscriber.Handle(account, folder.Entries); err != nil {
 				return fmt.Errorf("error handling %s @ cursor %s: %w",
 					account, folder.Cursor, err,
@@ -213,7 +233,8 @@ func (dbx *Dropbox) processUpdate(accounts []Account) error {
 			}
 		}
 
-		dbx.Cursors.Set(account, folder.Cursor)
+		// store current cursor
+		d.cursors.Set(account, folder.Cursor)
 	}
 
 	return nil

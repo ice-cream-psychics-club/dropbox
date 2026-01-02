@@ -16,19 +16,11 @@ import (
 	"github.com/ice-cream-psychics-club/dropbox/internal/pkg/subscriber"
 	"github.com/ice-cream-psychics-club/dropbox/pkg/csv"
 	"github.com/ice-cream-psychics-club/dropbox/pkg/dropbox"
-	"github.com/ice-cream-psychics-club/dropbox/pkg/store"
 )
 
 var developmentTimeout = 15 * time.Minute
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), developmentTimeout)
-	defer cancel()
-
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
-
 	var (
 		clientID     = getEnvOrElse("DROPBOX_ACCESS_KEY")
 		clientSecret = getEnvOrElse("DROPBOX_ACCESS_SECRET")
@@ -38,29 +30,38 @@ func main() {
 	)
 
 	// setup dependencies
-	oauth2, err := api.NewOAuth2(clientID, redirectURL)
+	ctx, cancel := context.WithTimeout(context.Background(), developmentTimeout)
+	defer cancel()
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+
+	oauth2, err := api.NewOAuth2(clientID, redirectURL, logger)
 	if err != nil {
 		panic(err)
 	}
 
+	dbx := api.NewDropbox(clientSecret, logger)
+	debugger := &subscriber.Logger{
+		Logger: logger,
+	}
 	propagator := &subscriber.Propagator{
 		Source: "responses.xlsx",
 		Targets: []subscriber.Target{
 			{
 				Name: "responses.csv",
 				Transform: func(r io.Reader) (io.Reader, error) {
+					// TODO: add transformations
+
+					// TODO: consider diffing methods -> append mode, while still handling edits
+					// (perhaps just treat a column or set of columns as a PK ?)
 					filePath := "./tmp/responses.xlsx"
 					return xlsxToCSV(filePath, r)
 				},
 			},
 		},
 		Logger: logger,
-	}
-
-	dbx := &api.Dropbox{
-		Logger:       logger,
-		Cursors:      &store.MemoryStore{},
-		ClientSecret: clientSecret,
 	}
 
 	// start server
@@ -73,21 +74,20 @@ func main() {
 	}()
 
 	logger.Debug("client initialized")
-	authClient := <-oauth2.Client()
 
-	// TODO: messy, find a better way to block requests until client has arrived
+	authClient := <-oauth2.Client()
 	client := &dropbox.Client{
 		HTTPClient: authClient,
 		Logger:     logger,
 	}
-	dbx.SetClient(client)
 
 	propagator.Client = client
-	dbx.Subscribe(&subscriber.Logger{Logger: logger}, propagator)
+	dbx.Subscribe(debugger, propagator)
+	dbx.SetClient(client)
 
 	logger.Debug("ready to make dropbox requests")
 
-	// shutdown
+	// handle shutdown
 	select {
 	case err := <-shutdown:
 		logger.Error(fmt.Sprintf("done listening and serving: %v", err))
@@ -118,6 +118,7 @@ func getEnvOrElse(k string) string {
 }
 
 func xlsxToCSV(filePath string, in io.Reader) (io.Reader, error) {
+	// create xlsx temp file
 	f, err := os.Create(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("error opening temporary file: %w", err)
@@ -128,6 +129,7 @@ func xlsxToCSV(filePath string, in io.Reader) (io.Reader, error) {
 		return nil, fmt.Errorf("error writing to %s: %w", filePath, err)
 	}
 
+	// convert to csv
 	buff := &bytes.Buffer{}
 	if err := csv.FromXLSX(filePath, buff); err != nil {
 		return nil, fmt.Errorf("error converting xlsx to csv: %w", err)
